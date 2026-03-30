@@ -1,6 +1,5 @@
 {
-  "name": "@openclaw/cortex-mem",
-  "version": "1.0.0",
+  "name": "cortex-mem",
   "version": "1.0.0",
   "description": "CortexMem — Brain-Inspired Memory System for OpenClaw (类脑记忆系统)",
   "main": "dist/index.js",
