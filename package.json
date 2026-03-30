@@ -50,6 +50,7 @@
     "LICENSE",
     "CONTRIBUTING.md",
     "CHANGELOG.md",
-    "monitoring"
+    "monitoring",
+    "openclaw.plugin.json"
   ]
 }
