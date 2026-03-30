@@ -1,0 +1,44 @@
+# 告警规则配置
+
+groups:
+  - name: evolution-v5-alerts
+    rules:
+      # Embedding Server 宕机告警
+      - alert: EmbeddingServerDown
+        expr: up{job="evolution-v5"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Embedding Server 宕机"
+          description: "Embedding Server 已停止响应超过 1 分钟"
+
+      # 错误率过高告警
+      - alert: HighErrorRate
+        expr: rate(request_errors_total{job="evolution-v5"}[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "错误率过高"
+          description: "过去 5 分钟错误率超过 10%"
+
+      # 响应时间过长告警
+      - alert: HighLatency
+        expr: histogram_quantile(0.95, rate(request_duration_seconds_bucket{job="evolution-v5"}[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "响应时间过长"
+          description: "P95 响应时间超过 1 秒"
+
+      # 记忆增长异常告警
+      - alert: MemoryGrowthAnomaly
+        expr: rate(memory_total{job="evolution-v5"}[1h]) > 100
+        for: 1h
+        labels:
+          severity: info
+        annotations:
+          summary: "记忆增长异常"
+          description: "过去 1 小时记忆增长超过 100 条"

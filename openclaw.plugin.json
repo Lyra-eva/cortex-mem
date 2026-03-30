@@ -1,0 +1,37 @@
+{
+  "id": "evolution-v5",
+  "name": "Evolution V5",
+  "description": "进化系统 - 记忆 + 任务调度 + 监控（整合版）",
+  "version": "5.0.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": true,
+    "properties": {
+      "autoInject": {
+        "type": "boolean",
+        "default": true,
+        "description": "自动注入记忆到上下文"
+      },
+      "autoSave": {
+        "type": "boolean",
+        "default": true,
+        "description": "自动保存对话到 episodes"
+      },
+      "maxMemories": {
+        "type": "number",
+        "default": 3,
+        "description": "自动注入的最大记忆数量"
+      },
+      "maxConcurrent": {
+        "type": "number",
+        "default": 10,
+        "description": "最大并发任务数"
+      },
+      "embeddingServerUrl": {
+        "type": "string",
+        "default": "http://127.0.0.1:9721",
+        "description": "Embedding Server URL"
+      }
+    }
+  }
+}

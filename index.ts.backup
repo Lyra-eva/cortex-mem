@@ -1,0 +1,538 @@
+/**
+ * Evolution V5 Plugin - 进化系统
+ * 
+ * 能力：
+ * 1. 语义记忆检索（contextInjector）— 自动注入相关记忆
+ * 2. 显式记忆存储（remember / search_memories）
+ * 3. 对话自动积累 — message:received/sent 钩子自动写入 episodes
+ * 4. 定期巩固 — 从 episodes 提取高频主题生成 concepts
+ * 5. 主动检索 — heartbeat 时整理和关联记忆
+ */
+
+import { Type } from '@sinclair/typebox';
+import * as fs from 'node:fs';
+
+const LOG_PATH = '/Users/lx/.openclaw/workspace/cognition/autosave.log';
+function debugLog(msg: string) { try { fs.appendFileSync(LOG_PATH, `[${new Date().toISOString()}] ${msg}\n`); } catch {} }
+
+// 模块加载测试
+debugLog('MODULE LOADED');
+
+// ===== 配置 =====
+interface EvolutionConfig {
+  autoInject?: boolean;
+  autoSave?: boolean;
+  maxMemories?: number;
+  embeddingServerUrl?: string;
+  consolidateIntervalMs?: number;
+  minEpisodesForConsolidate?: number;
+}
+
+const DEFAULT_CONFIG: EvolutionConfig = {
+  autoInject: true,
+  autoSave: true,
+  maxMemories: 3,
+  embeddingServerUrl: 'http://127.0.0.1:9721',
+  consolidateIntervalMs: 6 * 60 * 60 * 1000, // 6 小时
+  minEpisodesForConsolidate: 10,
+};
+
+let config: EvolutionConfig = DEFAULT_CONFIG;
+let redisClient: any = null;
+let lastConsolidateTime = 0;
+
+// 跳过的消息模式
+const SKIP_PATTERNS = ['你好', 'hello', 'hi', '早', '好', '谢谢', '感谢', '在吗', '嗯', '哦', 'ok', 'OK'];
+const SKIP_SAVE_PATTERNS = ['HEARTBEAT', 'NO_REPLY', 'HEARTBEAT_OK'];
+
+// 去重：最近保存的消息哈希
+const recentSaves = new Set<string>();
+const MAX_RECENT_SAVES = 200;
+
+function simpleHash(str: string): string {
+  let h = 0;
+  for (let i = 0; i < str.length; i++) {
+    h = ((h << 5) - h + str.charCodeAt(i)) | 0;
+  }
+  return h.toString(36);
+}
+
+// ===== Plugin 入口 =====
+const definePluginEntry = (def: any) => def;
+
+export default definePluginEntry({
+  id: 'evolution-v5',
+  name: 'Evolution V5',
+  description: '进化系统 - 语义记忆 + 自动积累 + 定期巩固',
+
+  async register(api: any) {
+    const g = global as any;
+    const isFirstLoad = !g.evolutionV5Initialized;
+    g.evolutionV5Initialized = true;
+    debugLog(`REGISTER mode=${api.registrationMode}, first=${isFirstLoad}`);
+
+    config = { ...DEFAULT_CONFIG, ...api.pluginConfig };
+
+    // Redis（只连一次）
+    if (isFirstLoad) {
+      try {
+        const redisModule = await import('redis');
+        const client = redisModule.default.createClient({ socket: { host: 'localhost', port: 6379 } });
+        await client.connect();
+        redisClient = client;
+        debugLog('Redis connected');
+      } catch (e) {
+        debugLog('Redis unavailable');
+      }
+      const serverOk = await checkEmbeddingServer();
+      debugLog(`Embedding Server: ${serverOk ? 'connected' : 'unavailable'}`);
+    }
+
+    // 钩子和工具每次都注册（OpenClaw 为每个 agent 调一次 register）
+
+    // ========== 能力 1: 语义记忆检索 (before_prompt_build) ==========
+    api.on('before_prompt_build', async (event: any, _ctx: any) => {
+      if (!config.autoInject) return {};
+
+      // 从 event.prompt 提取用户真实消息
+      let content = '';
+      const prompt = event?.prompt || '';
+      if (typeof prompt === 'string' && prompt.length > 0) {
+        // prompt 格式: metadata wrapper + 真实消息在最后一行
+        // 例如: "Sender (untrusted)...\n\n[message_id: ...]\nuser: 实际消息"
+        const lines = prompt.split('\n');
+        // 找最后一个非空行作为用户消息
+        for (let i = lines.length - 1; i >= 0; i--) {
+          const line = lines[i].trim();
+          if (line.length > 0) {
+            // 去掉可能的 "username: " 前缀
+            content = line.replace(/^[^\s:]+:\s*/, '');
+            break;
+          }
+        }
+      }
+
+      debugLog(`content resolved (${content.length}): ${content.slice(0,80)}`);
+
+      if (content.length < 8) return {};
+      if (SKIP_PATTERNS.some(p => content.toLowerCase().includes(p.toLowerCase()))) return {};
+
+      // 能力 3: 自动积累
+      if (config.autoSave && shouldSaveMessage(content, 'user')) {
+        saveEpisode(content, 'user', {}).then(() => {
+          debugLog(`✅ saved: ${content.slice(0,50)}`);
+        }).catch((e: any) => {
+          debugLog(`❌ save error: ${e?.message || e}`);
+        });
+      }
+
+      // 语义搜索
+      const memories = await semanticSearch(content, config.maxMemories || 3);
+      if (!memories || memories.length === 0) return {};
+
+      const memoryText = memories.map((m: any) => {
+        if (m.title) return `• [${m.category || ''}] ${m.title}: ${(m.content || m.concepts || '').slice(0, 200)}`;
+        if (m.key) return `• ${m.key}: ${m.value}`;
+        return `• ${(m.content || '').slice(0, 200)}`;
+      }).join('\n');
+
+      debugLog(`injecting ${memories.length} memories`);
+      return { prependSystemContext: `[记忆检索] 与当前话题相关的记忆：\n${memoryText}` };
+    });
+
+    // 能力 3 备注：自动积累通过 before_prompt_build 钩子实现
+
+    // ========== 能力 4: 定期巩固（通过工具触发） ==========
+    // ========== 能力 5: 主动检索（通过工具触发） ==========
+
+    // ===== 注册工具 =====
+
+    api.registerTool({
+      name: 'remember',
+      description: '存储显式事实到记忆中',
+      parameters: Type.Object({
+        key: Type.String({ description: '记忆的键' }),
+        value: Type.String({ description: '记忆的值' })
+      }),
+      async execute(_id: string, params: { key: string; value: string }) {
+        if (redisClient) {
+          await redisClient.hSet('memories:explicit', params.key, JSON.stringify({
+            key: params.key, value: params.value, created_at: new Date().toISOString()
+          }));
+        }
+        const saved = await saveToLanceDB('concepts', `${params.key}: ${params.value}`, {
+          title: params.key, category: 'explicit_memory',
+          tags: JSON.stringify(['explicit', 'user_defined']), quality_score: 0.8
+        });
+        return {
+          content: [{ type: 'text',
+            text: saved ? `已记住：${params.key}（LanceDB + Redis）` : `已记住：${params.key}（仅 Redis）`
+          }]
+        };
+      }
+    });
+
+    api.registerTool({
+      name: 'search_memories',
+      description: '语义检索记忆',
+      parameters: Type.Object({
+        query: Type.String({ description: '搜索查询' }),
+        limit: Type.Optional(Type.Number({ description: '返回数量限制', default: 5 }))
+      }),
+      async execute(_id: string, params: { query: string; limit?: number }) {
+        const limit = params.limit || 5;
+        const lanceResults = await semanticSearch(params.query, limit);
+        const redisResults = await searchRedis(params.query, limit);
+        const allResults = [...(lanceResults || []), ...(redisResults || [])];
+        const seen = new Set<string>();
+        const unique = allResults.filter(r => {
+          const id = r.id || r.key || r.title || '';
+          if (seen.has(id)) return false;
+          seen.add(id);
+          return true;
+        }).slice(0, limit);
+
+        const text = unique.length > 0
+          ? `找到 ${unique.length} 条相关记忆：\n\n` + unique.map((m: any, i: number) => {
+              const dist = m._distance !== undefined ? ` (相似度: ${(1 - m._distance).toFixed(3)})` : '';
+              if (m.title) return `${i+1}. [${m.category || ''}] **${m.title}**${dist}\n   ${(m.content || m.concepts || '').slice(0, 200)}`;
+              if (m.key) return `${i+1}. **${m.key}**: ${m.value}`;
+              return `${i+1}. ${(m.content || '').slice(0, 200)}`;
+            }).join('\n\n')
+          : '未找到相关记忆';
+        return { content: [{ type: 'text', text }] };
+      }
+    });
+
+    // 能力 4: 记忆巩固工具
+    api.registerTool({
+      name: 'consolidate_memories',
+      description: '巩固记忆：从近期对话(episodes)提取高频主题，生成概念(concepts)。在 heartbeat 或手动触发时调用。',
+      parameters: Type.Object({
+        force: Type.Optional(Type.Boolean({ description: '强制执行，忽略时间间隔', default: false }))
+      }),
+      async execute(_id: string, params: { force?: boolean }) {
+        return await consolidateMemories(params.force || false);
+      }
+    });
+
+    // 能力 5: 记忆统计工具
+    api.registerTool({
+      name: 'memory_stats',
+      description: '查看记忆系统统计：各表数据量、最近 episodes、巩固状态',
+      parameters: Type.Object({}),
+      async execute() {
+        return await getMemoryStats();
+      }
+    });
+
+    // 保留 delegate_task 和 get_task_status
+    api.registerTool({
+      name: 'delegate_task',
+      description: '委派任务给子智能体执行',
+      parameters: Type.Object({
+        description: Type.String({ description: '任务描述' }),
+        type: Type.Optional(Type.String({ description: '任务类型' })),
+        estimatedTime: Type.Optional(Type.Number({ description: '预计时间 (ms)', default: 120000 })),
+        priority: Type.Optional(Type.String({ description: '优先级', default: 'P3' }))
+      }),
+      async execute(_id: string, params: any) {
+        const taskId = `task_${Date.now()}`;
+        if (redisClient) {
+          await redisClient.hSet('tasks:active', taskId, JSON.stringify({
+            ...params, id: taskId, status: 'pending', createdAt: new Date().toISOString()
+          }));
+        }
+        return { taskId, content: [{ type: 'text', text: `任务已创建，ID: ${taskId}\n请使用 sessions_spawn 执行` }] };
+      }
+    });
+
+    api.registerTool({
+      name: 'get_task_status',
+      description: '获取任务状态',
+      parameters: Type.Object({
+        taskId: Type.String({ description: '任务 ID' })
+      }),
+      async execute(_id: string, params: { taskId: string }) {
+        if (redisClient) {
+          const data = await redisClient.hGet('tasks:active', params.taskId);
+          if (data) {
+            const task = JSON.parse(data);
+            return { content: [{ type: 'text', text: `任务 ${params.taskId}：${task.status}\n${task.description}` }] };
+          }
+        }
+        return { content: [{ type: 'text', text: `任务 ${params.taskId} 未找到` }] };
+      }
+    });
+
+    console.log('[Evolution V5] ✅ 初始化完成（语义搜索 + 自动积累 + 巩固工具）');
+  }
+});
+
+// ===== 能力 3: 对话自动积累逻辑 =====
+
+function shouldSaveMessage(content: string, role: string): boolean {
+  if (!content || content.length < 15) return false;
+  
+  // 跳过系统消息
+  if (SKIP_SAVE_PATTERNS.some(p => content.includes(p))) return false;
+  
+  // 跳过简单问候
+  if (content.length < 30 && SKIP_PATTERNS.some(p => content.toLowerCase().includes(p.toLowerCase()))) return false;
+
+  // 去重
+  const hash = simpleHash(content.slice(0, 200));
+  if (recentSaves.has(hash)) return false;
+  recentSaves.add(hash);
+  if (recentSaves.size > MAX_RECENT_SAVES) {
+    const first = recentSaves.values().next().value;
+    if (first) recentSaves.delete(first);
+  }
+
+  return true;
+}
+
+async function saveEpisode(content: string, role: string, context?: any): Promise<void> {
+  // 截断过长内容
+  const truncated = content.length > 500 ? content.slice(0, 500) + '...' : content;
+  
+  const metadata: any = {
+    source: role,
+    tags: JSON.stringify([role, 'auto_save']),
+    quality_score: role === 'user' ? 0.7 : 0.6,
+  };
+
+  // 添加上下文信息
+  if (context) {
+    const ctx: any = {};
+    if (context.channelId) ctx.channel = context.channelId;
+    if (context.senderId) ctx.sender = context.senderId;
+    if (context.isGroup) ctx.isGroup = true;
+    metadata.context = JSON.stringify(ctx);
+  }
+
+  // 先写 LanceDB（主存储），成功后再写 Redis（缓存）
+  const saved = await saveToLanceDB('episodes', truncated, metadata);
+  if (!saved) {
+    debugLog(`❌ LanceDB save failed, skip Redis cache`);
+    return;
+  }
+  
+  // Redis 只做缓存（48h TTL），失败不影响主流程
+  if (redisClient) {
+    try {
+      const key = `episode:${Date.now()}`;
+      await redisClient.set(key, JSON.stringify({ content: truncated, role, timestamp: new Date().toISOString() }), { EX: 172800 });
+    } catch (e) {
+      debugLog(`⚠️ Redis cache failed (non-critical): ${(e as Error).message}`);
+    }
+  }
+}
+
+// ===== 能力 4: 记忆巩固逻辑 =====
+
+async function consolidateMemories(force: boolean): Promise<any> {
+  const now = Date.now();
+  
+  // 检查间隔
+  if (!force && (now - lastConsolidateTime < (config.consolidateIntervalMs || 21600000))) {
+    const nextIn = Math.round(((config.consolidateIntervalMs || 21600000) - (now - lastConsolidateTime)) / 60000);
+    return { content: [{ type: 'text', text: `距离下次巩固还有 ${nextIn} 分钟。使用 force=true 强制执行。` }] };
+  }
+
+  try {
+    // 1. 获取近期 episodes
+    const resp = await fetch(`${config.embeddingServerUrl}/search`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: '对话记忆', table: 'episodes', limit: 50 })
+    });
+    
+    if (!resp.ok) {
+      return { content: [{ type: 'text', text: '巩固失败：无法连接 Embedding Server' }] };
+    }
+    
+    const data = await resp.json() as { results?: any[] };
+    const episodes = data.results || [];
+    
+    if (episodes.length < (config.minEpisodesForConsolidate || 10)) {
+      return { content: [{ type: 'text', text: `episodes 仅 ${episodes.length} 条，不足 ${config.minEpisodesForConsolidate} 条，跳过巩固。` }] };
+    }
+
+    // 2. 调用 Embedding Server 做关键词提取（jieba 分词 + 停用词过滤）
+    const consolidateResp = await fetch(`${config.embeddingServerUrl}/consolidate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ episodes, min_count: config.minEpisodesForConsolidate || 10 })
+    });
+    
+    if (!consolidateResp.ok) {
+      return { content: [{ type: 'text', text: '巩固失败：关键词提取失败' }] };
+    }
+    
+    const consolidateData = await consolidateResp.json() as { status?: string; keywords?: [string, number][]; analyzed_episodes?: number };
+    
+    if (consolidateData.status === 'skipped') {
+      return { content: [{ type: 'text', text: `跳过巩固：${consolidateData.reason}` }] };
+    }
+    
+    const themes = consolidateData.keywords || [];
+
+    if (themes.length === 0) {
+      lastConsolidateTime = now;
+      return { content: [{ type: 'text', text: `已分析 ${episodes.length} 条 episodes，未发现高频主题。` }] };
+    }
+
+    // 3. 为每个高频主题创建或更新 concept
+    let created = 0;
+    for (const [theme, count] of themes) {
+      // 检查是否已存在
+      const existing = await fetch(`${config.embeddingServerUrl}/search`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: theme, table: 'concepts', limit: 1 })
+      });
+      const existData = await existing.json() as { results?: any[] };
+      
+      // 如果已有高度匹配的 concept（距离 < 0.3），跳过
+      if (existData.results && existData.results.length > 0 && existData.results[0]._distance < 0.3) {
+        continue;
+      }
+
+      // 从相关 episodes 中提取上下文
+      const relatedEpisodes = episodes.filter((e: any) => (e.content || '').includes(theme)).slice(0, 3);
+      const contextSummary = relatedEpisodes.map((e: any) => (e.content || '').slice(0, 100)).join(' | ');
+
+      await saveToLanceDB('concepts', `${theme}: ${contextSummary}`, {
+        title: `对话主题: ${theme}`,
+        category: 'consolidated',
+        tags: JSON.stringify(['auto_consolidated', 'from_episodes']),
+        quality_score: Math.min(0.5 + count * 0.05, 0.9),
+      });
+      created++;
+    }
+
+    lastConsolidateTime = now;
+    
+    return {
+      content: [{
+        type: 'text',
+        text: `记忆巩固完成：\n` +
+          `- 分析 episodes: ${consolidateData.analyzed_episodes || episodes.length} 条\n` +
+          `- 发现高频主题: ${themes.length} 个\n` +
+          `- 新建 concepts: ${created} 个\n` +
+          `- 主题列表: ${themes.map(([t, c]) => `${t}(${c}次)`).join(', ')}`
+      }]
+    };
+  } catch (e) {
+    return { content: [{ type: 'text', text: `巩固失败：${(e as Error).message}` }] };
+  }
+}
+
+// ===== 能力 5: 记忆统计 =====
+
+async function getMemoryStats(): Promise<any> {
+  try {
+    const resp = await fetch(`${config.embeddingServerUrl}/health`);
+    if (!resp.ok) return { content: [{ type: 'text', text: 'Embedding Server 不可用' }] };
+    
+    const health = await resp.json() as { tables: string[] };
+    const stats: string[] = ['📊 记忆系统统计\n'];
+
+    for (const table of health.tables) {
+      const searchResp = await fetch(`${config.embeddingServerUrl}/search`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: '*', table, limit: 1 })
+      });
+      const searchData = await searchResp.json() as { count?: number; results?: any[] };
+      stats.push(`  ${table}: ~${searchData.count || 0}+ rows`);
+    }
+
+    // Redis stats
+    if (redisClient) {
+      const explicitCount = await redisClient.hLen('memories:explicit');
+      const episodeKeys = await redisClient.keys('episode:*');
+      stats.push(`\n  Redis 显式记忆: ${explicitCount}`);
+      stats.push(`  Redis episodes 缓存: ${episodeKeys.length} (48h TTL)`);
+    }
+
+    // 巩固状态
+    if (lastConsolidateTime > 0) {
+      const ago = Math.round((Date.now() - lastConsolidateTime) / 60000);
+      stats.push(`\n  上次巩固: ${ago} 分钟前`);
+    } else {
+      stats.push(`\n  尚未执行巩固`);
+    }
+
+    return { content: [{ type: 'text', text: stats.join('\n') }] };
+  } catch (e) {
+    return { content: [{ type: 'text', text: `统计失败：${(e as Error).message}` }] };
+  }
+}
+
+// ===== Embedding Server 通信 =====
+
+async function checkEmbeddingServer(): Promise<boolean> {
+  try {
+    const resp = await fetch(`${config.embeddingServerUrl}/health`);
+    return resp.ok;
+  } catch { return false; }
+}
+
+async function semanticSearch(query: string, limit: number = 3): Promise<any[]> {
+  try {
+    // 搜索 concepts + papers + episodes 三张表
+    const tables = ['concepts', 'papers', 'episodes'];
+    const allResults: any[] = [];
+
+    for (const table of tables) {
+      try {
+        const resp = await fetch(`${config.embeddingServerUrl}/search`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query, table, limit })
+        });
+        if (resp.ok) {
+          const data = await resp.json() as { results?: any[] };
+          if (data.results) allResults.push(...data.results);
+        }
+      } catch {}
+    }
+
+    // Sort by distance, return top N
+    allResults.sort((a: any, b: any) => (a._distance || 999) - (b._distance || 999));
+    return allResults.slice(0, limit);
+  } catch {
+    return [];
+  }
+}
+
+async function saveToLanceDB(table: string, content: string, metadata: any = {}): Promise<boolean> {
+  try {
+    const resp = await fetch(`${config.embeddingServerUrl}/save`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ table, content, metadata })
+    });
+    return resp.ok;
+  } catch { return false; }
+}
+
+// ===== Redis 辅助搜索 =====
+
+async function searchRedis(query: string, limit: number = 3): Promise<any[]> {
+  if (!redisClient) return [];
+  try {
+    const explicit = await redisClient.hGetAll('memories:explicit');
+    const results: any[] = [];
+    const q = query.toLowerCase();
+    for (const [key, val] of Object.entries(explicit)) {
+      if (typeof val === 'string' && (key.toLowerCase().includes(q) || val.toLowerCase().includes(q))) {
+        try { results.push(JSON.parse(val)); } catch {}
+        if (results.length >= limit) break;
+      }
+    }
+    return results;
+  } catch { return []; }
+}

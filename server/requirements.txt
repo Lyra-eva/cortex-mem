@@ -1,0 +1,17 @@
+# CortexMem Embedding Server Dependencies
+# Install: pip3 install -r requirements.txt
+
+# Embedding Model
+sentence-transformers>=2.2.0
+
+# Vector Database
+lancedb>=0.5.0
+
+# Cache Layer
+redis>=4.0.0
+
+# HTTP Server (built-in, listed for completeness)
+# http.server
+
+# Utilities
+numpy>=1.20.0

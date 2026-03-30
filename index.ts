@@ -1,0 +1,1106 @@
+/**
+ * Evolution V5 Plugin - 进化系统
+ * 
+ * 能力：
+ * 1. 语义记忆检索（contextInjector）— 自动注入相关记忆
+ * 2. 显式记忆存储（remember / search_memories）
+ * 3. 对话自动积累 — message:received/sent 钩子自动写入 episodes
+ * 4. 定期巩固 — 从 episodes 提取高频主题生成 concepts
+ * 5. 主动检索 — heartbeat 时整理和关联记忆
+ */
+
+import { Type } from '@sinclair/typebox';
+import * as fs from 'node:fs';
+
+const LOG_PATH = '/Users/lx/.openclaw/workspace/cognition/autosave.log';
+function debugLog(msg: string) { try { fs.appendFileSync(LOG_PATH, `[${new Date().toISOString()}] ${msg}\n`); } catch {} }
+
+// 模块加载测试
+debugLog('MODULE LOADED');
+
+// ===== 配置 =====
+interface EvolutionConfig {
+  autoInject?: boolean;
+  autoSave?: boolean;
+  maxMemories?: number;
+  embeddingServerUrl?: string;
+  consolidateIntervalMs?: number;
+  minEpisodesForConsolidate?: number;
+  disabledTools?: string[];
+}
+
+const DEFAULT_CONFIG: EvolutionConfig = {
+  autoInject: true,
+  autoSave: true,
+  maxMemories: 3,
+  embeddingServerUrl: 'http://127.0.0.1:9721',
+  consolidateIntervalMs: 6 * 60 * 60 * 1000, // 6 小时
+  minEpisodesForConsolidate: 10,
+};
+
+let config: EvolutionConfig = DEFAULT_CONFIG;
+let redisClient: any = null;
+let lastConsolidateTime = 0;
+
+// 跳过的消息模式
+const SKIP_PATTERNS = ['你好', 'hello', 'hi', '早', '好', '谢谢', '感谢', '在吗', '嗯', '哦', 'ok', 'OK'];
+const SKIP_SAVE_PATTERNS = ['HEARTBEAT', 'NO_REPLY', 'HEARTBEAT_OK'];
+
+// 去重：最近保存的消息哈希
+const recentSaves = new Set<string>();
+const MAX_RECENT_SAVES = 200;
+
+function simpleHash(str: string): string {
+  let h = 0;
+  for (let i = 0; i < str.length; i++) {
+    h = ((h << 5) - h + str.charCodeAt(i)) | 0;
+  }
+  return h.toString(36);
+}
+
+// ===== Plugin 入口 =====
+const definePluginEntry = (def: any) => def;
+
+export default definePluginEntry({
+  id: 'cortex-mem',
+  name: 'CortexMem',
+  description: 'CortexMem — Brain-Inspired Memory System (类脑记忆系统)',
+
+  async register(api: any) {
+    const g = global as any;
+    const isFirstLoad = !g.evolutionV5Initialized;
+    g.evolutionV5Initialized = true;
+    debugLog(`REGISTER mode=${api.registrationMode}, first=${isFirstLoad}`);
+
+    config = { ...DEFAULT_CONFIG, ...api.pluginConfig };
+
+    // Redis（只连一次）
+    if (isFirstLoad) {
+      try {
+        const redisModule = await import('redis');
+        const client = redisModule.default.createClient({ socket: { host: 'localhost', port: 6379 } });
+        await client.connect();
+        redisClient = client;
+        debugLog('Redis connected');
+      } catch (e) {
+        debugLog('Redis unavailable');
+      }
+      const serverOk = await checkEmbeddingServer();
+      debugLog(`Embedding Server: ${serverOk ? 'connected' : 'unavailable'}`);
+    }
+
+    // 钩子和工具每次都注册（OpenClaw 为每个 agent 调一次 register）
+
+    // ========== 能力 1: 语义记忆检索 (before_prompt_build) ==========
+    api.on('before_prompt_build', async (event: any, _ctx: any) => {
+      if (!config.autoInject) return {};
+
+      // 从 event.prompt 提取用户真实消息
+      let content = '';
+      const prompt = event?.prompt || '';
+      if (typeof prompt === 'string' && prompt.length > 0) {
+        // prompt 格式: metadata wrapper + 真实消息在最后一行
+        // 例如: "Sender (untrusted)...\n\n[message_id: ...]\nuser: 实际消息"
+        const lines = prompt.split('\n');
+        // 找最后一个非空行作为用户消息
+        for (let i = lines.length - 1; i >= 0; i--) {
+          const line = lines[i].trim();
+          if (line.length > 0) {
+            // 去掉可能的 "username: " 前缀
+            content = line.replace(/^[^\s:]+:\s*/, '');
+            break;
+          }
+        }
+      }
+
+      debugLog(`content resolved (${content.length}): ${content.slice(0,80)}`);
+
+      if (content.length < 8) return {};
+      if (SKIP_PATTERNS.some(p => content.toLowerCase().includes(p.toLowerCase()))) return {};
+
+      // 能力 3: 自动积累
+      if (config.autoSave && shouldSaveMessage(content, 'user')) {
+        // L0: 感觉缓冲（5 分钟 TTL）- 先保存瞬时记忆
+        saveToSensoryBuffer(content, 'user', { intent: detectIntent(content) }).then(() => {
+          debugLog(`✅ L0 saved: ${content.slice(0,50)}`);
+        }).catch((e: any) => {
+          debugLog(`❌ L0 save error: ${e?.message || e}`);
+        });
+        
+        // L2: 情景缓冲（24 小时）- 再保存情景记忆
+        saveEpisode(content, 'user', {}).then(() => {
+          debugLog(`✅ L2 saved: ${content.slice(0,50)}`);
+        }).catch((e: any) => {
+          debugLog(`❌ L2 save error: ${e?.message || e}`);
+        });
+      }
+
+      // 语义搜索
+      const memories = await semanticSearch(content, config.maxMemories || 3);
+      if (!memories || memories.length === 0) return {};
+
+      const memoryText = memories.map((m: any) => {
+        if (m.title) return `• [${m.category || ''}] ${m.title}: ${(m.content || m.concepts || '').slice(0, 200)}`;
+        if (m.key) return `• ${m.key}: ${m.value}`;
+        return `• ${(m.content || '').slice(0, 200)}`;
+      }).join('\n');
+
+      debugLog(`injecting ${memories.length} memories`);
+      return { prependSystemContext: `[记忆检索] 与当前话题相关的记忆：\n${memoryText}` };
+    });
+
+    // 能力 3 备注：自动积累通过 before_prompt_build 钩子实现
+
+    // ========== 能力 4: 定期巩固（通过工具触发） ==========
+    // ========== 能力 5: 主动检索（通过工具触发） ==========
+
+    // ===== 注册工具 =====
+
+    api.registerTool({
+      name: 'remember',
+      description: '存储显式事实到记忆中',
+      parameters: Type.Object({
+        key: Type.String({ description: '记忆的键' }),
+        value: Type.String({ description: '记忆的值' })
+      }),
+      async execute(_id: string, params: { key: string; value: string }) {
+        if (redisClient) {
+          await redisClient.hSet('memories:explicit', params.key, JSON.stringify({
+            key: params.key, value: params.value, created_at: new Date().toISOString()
+          }));
+        }
+        const saved = await saveToLanceDB('concepts', `${params.key}: ${params.value}`, {
+          title: params.key, category: 'explicit_memory',
+          tags: JSON.stringify(['explicit', 'user_defined']), quality_score: 0.8
+        });
+        return {
+          content: [{ type: 'text',
+            text: saved ? `已记住：${params.key}（LanceDB + Redis）` : `已记住：${params.key}（仅 Redis）`
+          }]
+        };
+      }
+    });
+
+    api.registerTool({
+      name: 'search_memories',
+      description: '语义检索记忆',
+      parameters: Type.Object({
+        query: Type.String({ description: '搜索查询' }),
+        limit: Type.Optional(Type.Number({ description: '返回数量限制', default: 5 }))
+      }),
+      async execute(_id: string, params: { query: string; limit?: number }) {
+        const limit = params.limit || 5;
+        const lanceResults = await semanticSearch(params.query, limit);
+        const redisResults = await searchRedis(params.query, limit);
+        const allResults = [...(lanceResults || []), ...(redisResults || [])];
+        const seen = new Set<string>();
+        const unique = allResults.filter(r => {
+          const id = r.id || r.key || r.title || '';
+          if (seen.has(id)) return false;
+          seen.add(id);
+          return true;
+        }).slice(0, limit);
+
+        const text = unique.length > 0
+          ? `找到 ${unique.length} 条相关记忆：\n\n` + unique.map((m: any, i: number) => {
+              const dist = m._distance !== undefined ? ` (相似度: ${(1 - m._distance).toFixed(3)})` : '';
+              if (m.title) return `${i+1}. [${m.category || ''}] **${m.title}**${dist}\n   ${(m.content || m.concepts || '').slice(0, 200)}`;
+              if (m.key) return `${i+1}. **${m.key}**: ${m.value}`;
+              return `${i+1}. ${(m.content || '').slice(0, 200)}`;
+            }).join('\n\n')
+          : '未找到相关记忆';
+        return { content: [{ type: 'text', text }] };
+      }
+    });
+
+    // ========== 1. learn - 6 步学习法（完整版） ==========
+    if (!config.disabledTools?.includes('learn')) {
+    api.registerTool({
+      name: 'learn',
+      description: '6 步学习法（搜索补齐→理解→关联→应用→反思→整合）',
+      parameters: Type.Object({
+        title: Type.String({ description: '学习材料标题' }),
+        content: Type.String({ description: '学习内容' }),
+        category: Type.Optional(Type.String({ description: '分类', default: 'general' })),
+        agent_id: Type.Optional(Type.String({ description: '智能体 ID', default: 'main' }))
+      }),
+      async execute(_id: string, params: any) {
+        try {
+          const agentId = params.agent_id || 'main';
+          const title = params.title || '未命名学习';
+          const content = params.content;
+          const category = params.category || 'general';
+
+          // ========== 第 0 步：搜索知识库补齐资料 ==========
+          const supplementSearchResp = await fetch(`${config.embeddingServerUrl}/search`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              query: title + ' ' + content.slice(0, 200),
+              agent_id: agentId,
+              type: 'semantic',
+              limit: 3
+            })
+          });
+          const supplementData: any = await supplementSearchResp.json();
+          const existingMemories = supplementData.results || [];
+          const supplementInfo = existingMemories.length > 0
+            ? `已有相关知识：\n` + existingMemories.map((m: any, i: number) => 
+                `  ${i+1}. ${m.content?.slice(0, 150)}...`
+              ).join('\n')
+            : '暂无相关知识，将学习新内容';
+
+          // ========== 第 1 步：学习 - 接收学习材料 ==========
+          // 已完成：接收 title + content
+
+          // ========== 第 2 步：理解 - 提取核心概念（关键词提取） ==========
+          // 简单关键词提取：找出现频率高的名词短语
+          const keywords = content.match(/[\u4e00-\u9fa5]{2,6}/g) || [];
+          const keywordCount: Record<string, number> = {};
+          keywords.forEach((k: string) => { keywordCount[k] = (keywordCount[k] || 0) + 1; });
+          const topKeywords = Object.entries(keywordCount)
+            .filter(([_, count]) => count >= 2)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 5);
+          
+          const concepts = topKeywords.map(([name, count]) => ({
+            name,
+            definition: `出现${count}次的关键词`
+          }));
+          
+          const conceptsText = concepts.length > 0
+            ? concepts.map((c: any) => `• **${c.name}**: ${c.definition}`).join('\n')
+            : '（暂无核心概念）';
+
+          // ========== 第 3 步：关联 - 检索相关记忆（同领域 + 跨领域） ==========
+          // 3a: 同领域检索
+          const sameDomainResp = await fetch(`${config.embeddingServerUrl}/search`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              query: content.slice(0, 500),
+              agent_id: agentId,
+              type: 'semantic',
+              limit: 5
+            })
+          });
+          const sameDomainData: any = await sameDomainResp.json();
+          const sameDomainMemories = sameDomainData.results || [];
+          
+          // 3b: 跨领域检索（排除同领域）
+          const crossDomainCategories = ['economics', 'psychology', 'communication', 'ai_ml', 'insights', 'books'].filter(c => c !== category);
+          const crossDomainMemories: any[] = [];
+          for (const crossCat of crossDomainCategories.slice(0, 3)) {
+            const crossResp = await fetch(`${config.embeddingServerUrl}/search`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                query: content.slice(0, 300),
+                agent_id: agentId,
+                type: 'semantic',
+                limit: 2
+              })
+            }).catch(() => null);
+            if (crossResp && crossResp.ok) {
+              const crossData: any = await crossResp.json();
+              const results = crossData.results || [];
+              results.forEach((m: any) => {
+                const meta = m.metadata ? (typeof m.metadata === 'string' ? JSON.parse(m.metadata) : m.metadata) : {};
+                if (meta.category && meta.category !== category) {
+                  m.cross_category = meta.category;
+                  crossDomainMemories.push(m);
+                }
+              });
+            }
+          }
+          
+          const relatedMemories = sameDomainMemories;
+          const relatedDesc = relatedMemories.length > 0
+            ? `**同领域关联**（${category}）:\n` + relatedMemories.map((m: any, i: number) => 
+                `  ${i+1}. ${m.content?.slice(0, 100)}...`
+              ).join('\n')
+            : '暂无同领域记忆';
+
+          // ========== 第 3.5 步：融会贯通 - 建立跨领域连接 ==========
+          const crossDomainDesc = crossDomainMemories.length > 0
+            ? crossDomainMemories.map((m: any) => {
+                const crossCat = m.cross_category || 'unknown';
+                const concept = concepts.length > 0 ? concepts[0].name : '核心概念';
+                return `• **${concept}** (${category}) → **${crossCat}**: ${m.content?.slice(0, 60)}...`;
+              }).join('\n')
+            : '暂无跨领域连接';
+          
+          // 保存跨领域连接用于后续存储
+          const knowledgeGraphConnections = crossDomainMemories.map((m: any) => ({
+            source: title,
+            sourceCategory: category,
+            target: m.id,
+            targetCategory: m.cross_category,
+            type: '融会贯通'
+          }));
+
+          // ========== 第 4 步：应用 - 生成应用场景（本领域 + 跨领域） ==========
+          const categoryApps: Record<string, string[]> = {
+            economics: ['宏观经济分析：判断当前经济周期位置', '投资决策：根据周期调整资产配置', '政策研究：理解财政政策逻辑'],
+            psychology: ['情绪识别：识别自己和他人的情绪状态', '决策优化：避免情绪化决策', '心理治疗：理解情绪触发机制'],
+            communication: ['写作表达：结构化表达观点', '演讲演示：结论先行吸引注意力', '日常沟通：倾听和回应技巧'],
+            ai_ml: ['模型优化：选择合适的加速技术', '系统设计：构建可靠的智能体', '应用开发：多模态应用设计'],
+            general: ['知识应用：将理论应用到实际问题', '跨领域学习：与其他知识建立联系', '教学分享：向他人解释概念']
+          };
+          const sameDomainApps = categoryApps[category] || categoryApps.general;
+          
+          // 跨领域应用
+          const crossDomainApps = crossDomainMemories.slice(0, 2).map((m: any) => {
+            const crossCat = m.cross_category || 'unknown';
+            return `+ ${crossCat}: 与${m.content?.slice(0, 30)}...建立联系`;
+          });
+          
+          const applications = sameDomainApps;
+          const appsText = `**本领域应用**:\n` + sameDomainApps.map((a: string, i: number) => `${i+1}. ${a}`).join('\n') + 
+            (crossDomainApps.length > 0 ? '\n\n**跨领域应用**:\n' + crossDomainApps.map((a: string, i: number) => `${i+1}. ${a}`).join('\n') : '');
+
+          // ========== 第 5 步：反思 - 评估理解深度（规则） ==========
+          // 基于内容长度和相关记忆数量评估
+          const contentLength = content.length;
+          const relatedCount = relatedMemories.length;
+          const crossDomainCount = crossDomainMemories.length;
+          let depth = 5;
+          if (contentLength > 1000) depth += 2;
+          else if (contentLength > 500) depth += 1;
+          if (relatedCount > 3) depth += 1;
+          if (relatedCount > 5) depth += 1;
+          if (crossDomainCount > 0) depth += 1;
+          depth = Math.min(depth, 10);
+          
+          const reflection = {
+            depth,
+            blindSpots: contentLength < 500 ? ['内容较短，可能需要补充细节'] : [],
+            nextSteps: ['用学到的知识分析实际问题', '与其他领域知识建立联系', '定期复习（1 天/3 天/7 天/15 天/30 天）'],
+            cross_domain_count: crossDomainCount
+          };
+
+          // ========== 第 6 步：整合 - 保存到 LanceDB ==========
+          const fullContent = `[${title}] ${content.slice(0, 2000)}`;
+          const saveBody = {
+              content: fullContent,
+              type: 'semantic',
+              importance: 0.85,
+              agent_id: agentId,
+              metadata: {
+                extra: {
+                  source: 'learn_6steps_ronghui',
+                  category: category,
+                  original_title: title,
+                  concepts: JSON.stringify(concepts),
+                  applications: JSON.stringify(applications),
+                  reflection: JSON.stringify(reflection),
+                  related_count: relatedMemories.length,
+                  related_ids: JSON.stringify(relatedMemories.map((m: any) => m.id)),
+                  cross_domain_count: crossDomainCount,
+                  cross_domain_ids: JSON.stringify(crossDomainMemories.map((m: any) => m.id)),
+                  knowledge_graph: JSON.stringify(knowledgeGraphConnections),
+                  supplement_info: supplementInfo,
+                  timestamp: Date.now()
+                }
+              }
+            };
+          debugLog(`[learn] Sending save request: ${JSON.stringify(saveBody).slice(0, 500)}...`);
+          const saveResp = await fetch(`${config.embeddingServerUrl}/save`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(saveBody)
+          });
+          
+          const saveData: any = await saveResp.json();
+          
+          // ========== 完整学习报告 ==========
+          const learnOutput = `📚 6 步学习法执行完成（含融会贯通）
+
+**学习材料：** ${title}
+**分类：** ${category}
+**记忆 ID：** ${saveData.id || '未知'}
+
+---
+
+**第 0 步：🔍 搜索补齐**
+${supplementInfo}
+
+**第 1 步：📖 学习**
+✅ 接收学习材料（${content.length}字）
+
+**第 2 步：🧠 理解**
+${conceptsText}
+
+**第 3 步：🔗 关联**
+${relatedDesc}
+
+**第 3.5 步：🔀 融会贯通**
+${crossDomainDesc}
+
+**第 4 步：💡 应用**
+${appsText}
+
+**第 5 步：🤔 反思**
+- 理解深度：**${reflection.depth}/10**
+- 同领域关联：${relatedMemories.length}条
+- 跨领域关联：${crossDomainCount}条
+- 盲点：${reflection.blindSpots.length > 0 ? reflection.blindSpots.join(', ') : '无明显盲点'}
+- 下一步：${reflection.nextSteps?.[0] || '继续深入学习'}
+
+**第 6 步：💾 整合**
+✅ 已保存到 LanceDB
+✅ 建立${crossDomainCount}条跨领域连接
+
+---
+
+**复习建议：** 1 天/3 天/7 天/15 天/30 天`;
+
+          return {
+            content: [{ type: 'text', text: learnOutput }]
+          };
+        } catch (e) {
+          return {
+            content: [{ type: 'text', text: `❌ 学习失败：${(e as Error).message}` }]
+          };
+        }
+      }
+    });
+    } // disabledTools check
+
+    // 能力 4: 记忆巩固工具
+    api.registerTool({
+      name: 'consolidate_memories',
+      description: '巩固记忆：从近期对话(episodes)提取高频主题，生成概念(concepts)。在 heartbeat 或手动触发时调用。',
+      parameters: Type.Object({
+        force: Type.Optional(Type.Boolean({ description: '强制执行，忽略时间间隔', default: false }))
+      }),
+      async execute(_id: string, params: { force?: boolean }) {
+        return await consolidateMemories(params.force || false);
+      }
+    });
+
+    // 能力 5: 模式完成（P0 类人脑功能）
+    if (!config.disabledTools?.includes('pattern_completion')) {
+    api.registerTool({
+      name: 'pattern_completion',
+      description: '模式完成：根据部分线索回忆完整记忆簇（PageRank 图扩散算法）',
+      parameters: Type.Object({
+        query: Type.String({ description: '检索线索' }),
+        agent_id: Type.Optional(Type.String({ description: '智能体 ID', default: 'main' })),
+        top_k: Type.Optional(Type.Number({ description: '返回数量', default: 10 }))
+      }),
+      async execute(_id: string, params: any) {
+        try {
+          const resp = await fetch(`${config.embeddingServerUrl}/pattern_completion`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(params)
+          });
+          const data: any = await resp.json();
+          if (data.error) {
+            return { content: [{ type: 'text', text: `❌ 错误：${data.error}` }] };
+          }
+          const results = data.results || [];
+          const summary = `🧠 模式完成：找到 ${results.length} 条相关记忆\n\n` +
+            results.map((r: any, i: number) =>
+              `${i+1}. [${r.type}] ${r.content?.slice(0, 100)}... (分数：${(r.ppr_score || 0).toFixed(3)})`
+            ).join('\n');
+          return { content: [{ type: 'text', text: summary }] };
+        } catch (e) {
+          return { content: [{ type: 'text', text: `❌ 失败：${(e as Error).message}` }] };
+        }
+      }
+    });
+    }
+
+    // 能力 6: 聚类激活（P1 类人脑功能）
+    if (!config.disabledTools?.includes('cluster_activation')) {
+    api.registerTool({
+      name: 'cluster_activation',
+      description: '聚类激活：激活种子记忆所在的整个记忆簇（Louvain 社区发现算法）',
+      parameters: Type.Object({
+        action: Type.String({ description: '操作类型', enum: ['detect', 'activate'] }),
+        seed_memory_id: Type.Optional(Type.String({ description: '种子记忆 ID（activate 模式需要）' })),
+        agent_id: Type.Optional(Type.String({ description: '智能体 ID', default: 'main' }))
+      }),
+      async execute(_id: string, params: any) {
+        try {
+          const resp = await fetch(`${config.embeddingServerUrl}/cluster_activation`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(params)
+          });
+          const data: any = await resp.json();
+          if (data.error) {
+            return { content: [{ type: 'text', text: `❌ 错误：${data.error}` }] };
+          }
+          if (params.action === 'detect') {
+            const communities = data.communities || {};
+            const summary = `🧠 社区发现：找到 ${data.count} 个记忆簇\n\n` +
+              Object.entries(communities).map(([id, members]: [string, any]) =>
+                `簇 ${id}: ${Array.isArray(members) ? members.length : 0} 条记忆`
+              ).join('\n');
+            return { content: [{ type: 'text', text: summary }] };
+          } else {
+            const results = data.results || [];
+            const summary = `🧠 聚类激活：激活 ${results.length} 条相关记忆\n\n` +
+              results.map((r: any, i: number) =>
+                `${i+1}. [${r.type}] ${r.content?.slice(0, 80)}...`
+              ).join('\n');
+            return { content: [{ type: 'text', text: summary }] };
+          }
+        } catch (e) {
+          return { content: [{ type: 'text', text: `❌ 失败：${(e as Error).message}` }] };
+        }
+      }
+    });
+    }
+
+    // 能力 7: 多跳检索（P1 类人脑功能）
+    if (!config.disabledTools?.includes('multi_hop_search')) {
+    api.registerTool({
+      name: 'multi_hop_search',
+      description: '多跳检索：链式联想检索（BFS 图遍历，A→B→C）',
+      parameters: Type.Object({
+        query: Type.String({ description: '检索线索' }),
+        agent_id: Type.Optional(Type.String({ description: '智能体 ID', default: 'main' })),
+        hops: Type.Optional(Type.Number({ description: '跳跃次数', default: 2 })),
+        limit: Type.Optional(Type.Number({ description: '返回数量', default: 10 }))
+      }),
+      async execute(_id: string, params: any) {
+        try {
+          const resp = await fetch(`${config.embeddingServerUrl}/hop`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(params)
+          });
+          const data: any = await resp.json();
+          if (data.error) {
+            return { content: [{ type: 'text', text: `❌ 错误：${data.error}` }] };
+          }
+          const results = data.results || [];
+          const summary = `🧠 多跳检索 (${params.hops || 2}跳)：找到 ${data.count || results.length} 条相关记忆\n\n` +
+            results.map((r: any, i: number) =>
+              `${i+1}. [${r.type}] ${r.content?.slice(0, 100)}...`
+            ).join('\n');
+          return { content: [{ type: 'text', text: summary }] };
+        } catch (e) {
+          return { content: [{ type: 'text', text: `❌ 失败：${(e as Error).message}` }] };
+        }
+      }
+    });
+    }
+
+    // 能力 8: 记忆统计工具
+    api.registerTool({
+      name: 'memory_stats',
+      description: '查看记忆系统统计：各表数据量、最近 episodes、巩固状态',
+      parameters: Type.Object({}),
+      async execute() {
+        return await getMemoryStats();
+      }
+    });
+
+    // ===== L0 感觉缓冲工具 =====
+    api.registerTool({
+      name: 'get_sensory',
+      description: '获取 L0 感觉缓冲状态（瞬时记忆，5 分钟 TTL）',
+      parameters: Type.Object({
+        agent_id: Type.Optional(Type.String({ description: '智能体 ID', default: 'main' }))
+      }),
+      async execute(_id: string, params: { agent_id?: string }) {
+        const status = await getSensoryStatus(params.agent_id || 'main');
+        if (!status) {
+          return { content: [{ type: 'text', text: '❌ 无法获取 L0 感觉缓冲状态' }] };
+        }
+        const text = `🧠 L0 感觉缓冲状态\n\n` +
+          `- 缓存数量：${status.count || 0} 条\n` +
+          `- TTL: 5 分钟\n` +
+          `- 最近缓存：${(status.keys || []).slice(0, 5).join(', ') || '无'}`;
+        return { content: [{ type: 'text', text }] };
+      }
+    });
+
+    api.registerTool({
+      name: 'get_sensory_by_key',
+      description: '按 key 获取 L0 感觉缓冲内容',
+      parameters: Type.Object({
+        key: Type.String({ description: '感觉缓冲 key' }),
+        agent_id: Type.Optional(Type.String({ description: '智能体 ID', default: 'main' }))
+      }),
+      async execute(_id: string, params: { key: string; agent_id?: string }) {
+        try {
+          const resp = await fetch(`${config.embeddingServerUrl}/sensory`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              action: 'get',
+              agent_id: params.agent_id || 'main',
+              key: params.key
+            })
+          });
+          
+          if (!resp.ok) {
+            return { content: [{ type: 'text', text: '❌ 获取失败' }] };
+          }
+          
+          const data: any = await resp.json();
+          if (data.status === 'expired') {
+            return { content: [{ type: 'text', text: `⏰ 感觉缓冲已过期（key: ${params.key}）` }] };
+          }
+          
+          const value = typeof data.value === 'string' ? JSON.parse(data.value) : data.value;
+          const text = `🧠 L0 感觉缓冲内容\n\n` +
+            `- Key: ${params.key}\n` +
+            `- 时间：${new Date(value.timestamp).toLocaleString('zh-CN')}\n` +
+            `- 情绪：${value.emotion || 'neutral'}\n` +
+            `- 意图：${value.intent || 'unknown'}\n` +
+            `- 内容：${value.user_input?.slice(0, 200) || '无'}`;
+          return { content: [{ type: 'text', text }] };
+        } catch (e) {
+          return { content: [{ type: 'text', text: `❌ 获取失败：${(e as Error).message}` }] };
+        }
+      }
+    });
+
+    api.registerTool({
+      name: 'clear_sensory',
+      description: '清除 L0 感觉缓冲',
+      parameters: Type.Object({
+        agent_id: Type.Optional(Type.String({ description: '智能体 ID', default: 'main' }))
+      }),
+      async execute(_id: string, params: { agent_id?: string }) {
+        try {
+          const status = await getSensoryStatus(params.agent_id || 'main');
+          const count = status?.count || 0;
+          
+          // 获取所有 key 并逐个删除
+          if (status?.keys && status.keys.length > 0) {
+            for (const key of status.keys) {
+              await fetch(`${config.embeddingServerUrl}/sensory`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  action: 'delete',
+                  agent_id: params.agent_id || 'main',
+                  key: key
+                })
+              });
+            }
+          }
+          
+          return { content: [{ type: 'text', text: `✅ 已清除 ${count} 条 L0 感觉缓冲` }] };
+        } catch (e) {
+          return { content: [{ type: 'text', text: `❌ 清除失败：${(e as Error).message}` }] };
+        }
+      }
+    });
+
+    // 保留 delegate_task 和 get_task_status
+    api.registerTool({
+      name: 'delegate_task',
+      description: '委派任务给子智能体执行',
+      parameters: Type.Object({
+        description: Type.String({ description: '任务描述' }),
+        type: Type.Optional(Type.String({ description: '任务类型' })),
+        estimatedTime: Type.Optional(Type.Number({ description: '预计时间 (ms)', default: 120000 })),
+        priority: Type.Optional(Type.String({ description: '优先级', default: 'P3' }))
+      }),
+      async execute(_id: string, params: any) {
+        const taskId = `task_${Date.now()}`;
+        if (redisClient) {
+          await redisClient.hSet('tasks:active', taskId, JSON.stringify({
+            ...params, id: taskId, status: 'pending', createdAt: new Date().toISOString()
+          }));
+        }
+        return { taskId, content: [{ type: 'text', text: `任务已创建，ID: ${taskId}\n请使用 sessions_spawn 执行` }] };
+      }
+    });
+
+    api.registerTool({
+      name: 'get_task_status',
+      description: '获取任务状态',
+      parameters: Type.Object({
+        taskId: Type.String({ description: '任务 ID' })
+      }),
+      async execute(_id: string, params: { taskId: string }) {
+        if (redisClient) {
+          const data = await redisClient.hGet('tasks:active', params.taskId);
+          if (data) {
+            const task = JSON.parse(data);
+            return { content: [{ type: 'text', text: `任务 ${params.taskId}：${task.status}\n${task.description}` }] };
+          }
+        }
+        return { content: [{ type: 'text', text: `任务 ${params.taskId} 未找到` }] };
+      }
+    });
+
+    console.log('[Evolution V5] ✅ 初始化完成（语义搜索 + 自动积累 + 巩固工具）');
+  }
+});
+
+// ===== 能力 3: 对话自动积累逻辑 =====
+
+function shouldSaveMessage(content: string, role: string): boolean {
+  if (!content || content.length < 15) return false;
+  
+  // 跳过系统消息
+  if (SKIP_SAVE_PATTERNS.some(p => content.includes(p))) return false;
+  
+  // 跳过简单问候
+  if (content.length < 30 && SKIP_PATTERNS.some(p => content.toLowerCase().includes(p.toLowerCase()))) return false;
+
+  // 去重
+  const hash = simpleHash(content.slice(0, 200));
+  if (recentSaves.has(hash)) return false;
+  recentSaves.add(hash);
+  if (recentSaves.size > MAX_RECENT_SAVES) {
+    const first = recentSaves.values().next().value;
+    if (first) recentSaves.delete(first);
+  }
+
+  return true;
+}
+
+async function saveEpisode(content: string, role: string, context?: any): Promise<void> {
+  // 截断过长内容
+  const truncated = content.length > 500 ? content.slice(0, 500) + '...' : content;
+  
+  const metadata: any = {
+    source: role,
+    tags: JSON.stringify([role, 'auto_save']),
+    quality_score: role === 'user' ? 0.7 : 0.6,
+  };
+
+  // 添加上下文信息
+  if (context) {
+    const ctx: any = {};
+    if (context.channelId) ctx.channel = context.channelId;
+    if (context.senderId) ctx.sender = context.senderId;
+    if (context.isGroup) ctx.isGroup = true;
+    metadata.context = JSON.stringify(ctx);
+  }
+
+  // 先写 LanceDB（主存储），成功后再写 Redis（缓存）
+  const saved = await saveToLanceDB('episodes', truncated, metadata);
+  if (!saved) {
+    debugLog(`❌ LanceDB save failed, skip Redis cache`);
+    return;
+  }
+  
+  // Redis 只做缓存（48h TTL），失败不影响主流程
+  if (redisClient) {
+    try {
+      const key = `episode:${Date.now()}`;
+      await redisClient.set(key, JSON.stringify({ content: truncated, role, timestamp: new Date().toISOString() }), { EX: 172800 });
+    } catch (e) {
+      debugLog(`⚠️ Redis cache failed (non-critical): ${(e as Error).message}`);
+    }
+  }
+}
+
+// ===== 能力 4: 记忆巩固逻辑 =====
+
+async function consolidateMemories(force: boolean): Promise<any> {
+  const now = Date.now();
+  
+  // 检查间隔
+  if (!force && (now - lastConsolidateTime < (config.consolidateIntervalMs || 21600000))) {
+    const nextIn = Math.round(((config.consolidateIntervalMs || 21600000) - (now - lastConsolidateTime)) / 60000);
+    return { content: [{ type: 'text', text: `距离下次巩固还有 ${nextIn} 分钟。使用 force=true 强制执行。` }] };
+  }
+
+  try {
+    // 1. 获取近期 episodes
+    const resp = await fetch(`${config.embeddingServerUrl}/search`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: '对话记忆', table: 'episodes', limit: 50 })
+    });
+    
+    if (!resp.ok) {
+      return { content: [{ type: 'text', text: '巩固失败：无法连接 Embedding Server' }] };
+    }
+    
+    const data = await resp.json() as { results?: any[] };
+    const episodes = data.results || [];
+    
+    if (episodes.length < (config.minEpisodesForConsolidate || 10)) {
+      return { content: [{ type: 'text', text: `episodes 仅 ${episodes.length} 条，不足 ${config.minEpisodesForConsolidate} 条，跳过巩固。` }] };
+    }
+
+    // 2. 提取关键词和主题
+    const allContent = episodes.map((e: any) => e.content || '').join(' ');
+    
+    // 简单关键词提取（词频统计）
+    const words = allContent.split(/[\s,，。！？、；：""''（）\[\]{}]+/).filter((w: string) => w.length >= 2 && w.length <= 20);
+    const freq: Record<string, number> = {};
+    for (const w of words) {
+      freq[w] = (freq[w] || 0) + 1;
+    }
+    
+    // 过滤高频主题（出现 >= 3 次）
+    const themes = Object.entries(freq)
+      .filter(([_, count]) => count >= 3)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 10);
+
+    if (themes.length === 0) {
+      lastConsolidateTime = now;
+      return { content: [{ type: 'text', text: `已分析 ${episodes.length} 条 episodes，未发现高频主题。` }] };
+    }
+
+    // 3. 为每个高频主题创建或更新 concept
+    let created = 0;
+    for (const [theme, count] of themes) {
+      // 检查是否已存在
+      const existing = await fetch(`${config.embeddingServerUrl}/search`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: theme, table: 'concepts', limit: 1 })
+      });
+      const existData = await existing.json() as { results?: any[] };
+      
+      // 如果已有高度匹配的 concept（距离 < 0.3），跳过
+      if (existData.results && existData.results.length > 0 && existData.results[0]._distance < 0.3) {
+        continue;
+      }
+
+      // 从相关 episodes 中提取上下文
+      const relatedEpisodes = episodes.filter((e: any) => (e.content || '').includes(theme)).slice(0, 3);
+      const contextSummary = relatedEpisodes.map((e: any) => (e.content || '').slice(0, 100)).join(' | ');
+
+      await saveToLanceDB('concepts', `${theme}: ${contextSummary}`, {
+        title: `对话主题: ${theme}`,
+        category: 'consolidated',
+        tags: JSON.stringify(['auto_consolidated', 'from_episodes']),
+        quality_score: Math.min(0.5 + count * 0.05, 0.9),
+      });
+      created++;
+    }
+
+    lastConsolidateTime = now;
+    
+    return {
+      content: [{
+        type: 'text',
+        text: `记忆巩固完成：\n` +
+          `- 分析 episodes: ${episodes.length} 条\n` +
+          `- 发现高频主题: ${themes.length} 个\n` +
+          `- 新建 concepts: ${created} 个\n` +
+          `- 主题列表: ${themes.map(([t, c]) => `${t}(${c}次)`).join(', ')}`
+      }]
+    };
+  } catch (e) {
+    return { content: [{ type: 'text', text: `巩固失败：${(e as Error).message}` }] };
+  }
+}
+
+// ===== 能力 5: 记忆统计 =====
+
+async function getMemoryStats(): Promise<any> {
+  try {
+    const resp = await fetch(`${config.embeddingServerUrl}/health`);
+    if (!resp.ok) return { content: [{ type: 'text', text: 'Embedding Server 不可用' }] };
+    
+    const health = await resp.json() as { tenants?: string[]; stats?: Record<string, {memories?: number}>; uptime?: string; requests?: number; errors?: number };
+    const stats: string[] = ['📊 记忆系统统计\n'];
+
+    // 使用 health.stats 获取各智能体记忆数
+    if (health.stats) {
+      for (const [agentId, data] of Object.entries(health.stats)) {
+        const count = data.memories || 0;
+        stats.push(`  ${agentId}: ${count} 条记忆`);
+      }
+      const total = Object.values(health.stats).reduce((sum, d) => sum + (d.memories || 0), 0);
+      stats.push(`\n  总计：${total} 条记忆`);
+    }
+
+    // 服务器状态
+    if (health.uptime) stats.push(`\n  运行时长：${health.uptime}`);
+    if (health.requests !== undefined) stats.push(`  请求数：${health.requests}`);
+    if (health.errors !== undefined) stats.push(`  错误数：${health.errors}`);
+
+    // Redis stats
+    if (redisClient) {
+      const explicitCount = await redisClient.hLen('memories:explicit');
+      const episodeKeys = await redisClient.keys('episode:*');
+      stats.push(`\n  Redis 显式记忆: ${explicitCount}`);
+      stats.push(`  Redis episodes 缓存: ${episodeKeys.length} (48h TTL)`);
+    }
+
+    // 巩固状态
+    if (lastConsolidateTime > 0) {
+      const ago = Math.round((Date.now() - lastConsolidateTime) / 60000);
+      stats.push(`\n  上次巩固: ${ago} 分钟前`);
+    } else {
+      stats.push(`\n  尚未执行巩固`);
+    }
+
+    return { content: [{ type: 'text', text: stats.join('\n') }] };
+  } catch (e) {
+    return { content: [{ type: 'text', text: `统计失败：${(e as Error).message}` }] };
+  }
+}
+
+// ===== Embedding Server 通信 =====
+
+async function checkEmbeddingServer(): Promise<boolean> {
+  try {
+    const resp = await fetch(`${config.embeddingServerUrl}/health`);
+    return resp.ok;
+  } catch { return false; }
+}
+
+async function semanticSearch(query: string, limit: number = 3): Promise<any[]> {
+  try {
+    // 搜索 concepts + papers + episodes 三张表
+    const tables = ['concepts', 'papers', 'episodes'];
+    const allResults: any[] = [];
+
+    for (const table of tables) {
+      try {
+        const resp = await fetch(`${config.embeddingServerUrl}/search`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query, table, limit })
+        });
+        if (resp.ok) {
+          const data = await resp.json() as { results?: any[] };
+          if (data.results) allResults.push(...data.results);
+        }
+      } catch {}
+    }
+
+    // Sort by distance, return top N
+    allResults.sort((a: any, b: any) => (a._distance || 999) - (b._distance || 999));
+    return allResults.slice(0, limit);
+  } catch {
+    return [];
+  }
+}
+
+async function saveToLanceDB(table: string, content: string, metadata: any = {}): Promise<boolean> {
+  try {
+    const resp = await fetch(`${config.embeddingServerUrl}/save`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ table, content, metadata })
+    });
+    return resp.ok;
+  } catch { return false; }
+}
+
+// ===== Redis 辅助搜索 =====
+
+async function searchRedis(query: string, limit: number = 3): Promise<any[]> {
+  if (!redisClient) return [];
+  try {
+    const explicit = await redisClient.hGetAll('memories:explicit');
+    const results: any[] = [];
+    const q = query.toLowerCase();
+    for (const [key, val] of Object.entries(explicit)) {
+      if (typeof val === 'string' && (key.toLowerCase().includes(q) || val.toLowerCase().includes(q))) {
+        try { results.push(JSON.parse(val)); } catch {}
+        if (results.length >= limit) break;
+      }
+    }
+    return results;
+  } catch { return []; }
+}
+
+// ===== L0 感觉缓冲功能 =====
+
+/**
+ * 保存到 L0 感觉缓冲（5 分钟 TTL）
+ */
+async function saveToSensoryBuffer(content: string, role: string, metadata: any = {}): Promise<boolean> {
+  try {
+    const sensoryData = {
+      user_input: content.slice(0, 200),
+      timestamp: Date.now(),
+      role: role,
+      emotion: detectEmotion(content),
+      intent: metadata.intent || 'unknown'
+    };
+    
+    const resp = await fetch(`${config.embeddingServerUrl}/sensory`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'set',
+        agent_id: metadata.agent_id || 'main',
+        key: `sensory_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        value: JSON.stringify(sensoryData)
+      })
+    });
+    
+    return resp.ok;
+  } catch (e) {
+    debugLog(`❌ L0 save error: ${(e as Error).message}`);
+    return false;
+  }
+}
+
+/**
+ * 获取 L0 感觉缓冲状态
+ */
+async function getSensoryStatus(agentId: string = 'main'): Promise<any> {
+  try {
+    const resp = await fetch(`${config.embeddingServerUrl}/sensory`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'status',
+        agent_id: agentId
+      })
+    });
+    
+    if (!resp.ok) return null;
+    return await resp.json();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 简单情绪识别（关键词匹配）
+ */
+function detectEmotion(text: string): string {
+  const emotionKeywords: Record<string, string[]> = {
+    'happy': ['开心', '高兴', '好', '棒', '赞', '哈哈', '😄', '😊', '🎉'],
+    'sad': ['难过', '伤心', '累', '烦', '😢', '😞', '💔'],
+    'angry': ['生气', '烦', '讨厌', '😠', '😡', '👎'],
+    'surprised': ['惊讶', '哇', '啊', '😮', '😲', '❗'],
+    'neutral': []
+  };
+  
+  const lowerText = text.toLowerCase();
+  for (const [emotion, keywords] of Object.entries(emotionKeywords)) {
+    if (emotion === 'neutral') continue;
+    if (keywords.some(k => lowerText.includes(k.toLowerCase()))) {
+      return emotion;
+    }
+  }
+  return 'neutral';
+}
+
+/**
+ * 简单意图识别
+ */
+function detectIntent(text: string): string {
+  const intentPatterns: Record<string, RegExp[]> = {
+    'question': [/什么/, /为什么/, /怎么/, /何时/, /哪里/, /谁/, /\?/],
+    'command': [/请/, /帮我/, /执行/, /运行/, /打开/, /关闭/],
+    'search': [/搜索/, /查找/, /检索/, /查询/, /找/],
+    'chat': [/你好/, /早/, /好/, /在吗/, /hello/, /hi/]
+  };
+  
+  for (const [intent, patterns] of Object.entries(intentPatterns)) {
+    if (patterns.some(p => p.test(text))) {
+      return intent;
+    }
+  }
+  return 'unknown';
+}
+

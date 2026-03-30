@@ -1,0 +1,57 @@
+{
+  "name": "@openclaw/cortex-mem",
+  "version": "1.0.0",
+  "version": "1.0.0",
+  "description": "CortexMem — Brain-Inspired Memory System for OpenClaw (类脑记忆系统)",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "python3 server/embedding_server.py",
+    "test": "jest",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "keywords": [
+    "openclaw",
+    "plugin",
+    "memory",
+    "brain-inspired",
+    "cortex",
+    "semantic-search",
+    "vector-store",
+    "redis",
+    "lancedb"
+  ],
+  "author": "OpenClaw Team",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/openclaw/cortex-mem.git"
+  },
+  "homepage": "https://github.com/openclaw/cortex-mem#readme",
+  "bugs": {
+    "url": "https://github.com/openclaw/cortex-mem/issues"
+  },
+  "dependencies": {
+    "@hasanshoaib/ai-kit": "^0.5.18",
+    "@sinclair/typebox": "^0.32.0",
+    "redis": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "dist",
+    "server/*.py",
+    "server/requirements.txt",
+    "README.md",
+    "LICENSE",
+    "CONTRIBUTING.md",
+    "CHANGELOG.md",
+    "monitoring"
+  ]
+}

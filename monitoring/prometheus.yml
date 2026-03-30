@@ -1,0 +1,30 @@
+# Prometheus 监控配置
+# 使用方法：
+# 1. 安装 Prometheus: brew install prometheus
+# 2. 启动：prometheus --config.file=monitoring/prometheus.yml
+# 3. 访问：http://localhost:9090
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'evolution-v5'
+    static_configs:
+      - targets: ['localhost:9721']
+    metrics_path: '/metrics'
+    scrape_interval: 30s
+
+  - job_name: 'openclaw-gateway'
+    static_configs:
+      - targets: ['localhost:9720']
+    scrape_interval: 30s
+
+# Alerting rules
+rule_files:
+  - 'alerts.yml'
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['localhost:9093']

@@ -1,0 +1,48 @@
+# 源码备份
+*.bak
+*.backup
+
+# 开发文档
+docs/
+AUTO_TRIGGER_DESIGN.md
+IMPROVEMENT_REPORT.md
+L0_INTEGRATION_REPORT.md
+
+# 监控配置（可选包含）
+# monitoring/
+
+# 测试
+tests/
+coverage/
+
+# 日志（不打包日志文件）
+*.log
+logs/
+server/logs/
+server/data/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Node modules（npm 自动处理）
+node_modules/
+
+# 构建产物（保留 dist）
+# dist/
+
+# 数据（不打包用户数据）
+server/data/lancedb/
+server/data/*.lance
+server/data/
+
+# 临时文件
+tmp/
+temp/
+*.tmp
