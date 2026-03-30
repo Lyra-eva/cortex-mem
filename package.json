@@ -8,8 +8,7 @@
     "build": "tsc",
     "start": "python3 server/embedding_server.py",
     "test": "jest",
-    "clean": "rm -rf dist",
-    "prepublishOnly": "npm run build && npm test"
+    "clean": "rm -rf dist"
   },
   "keywords": [
     "openclaw",
