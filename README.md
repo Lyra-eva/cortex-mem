@@ -17,7 +17,7 @@
 
 ```bash
 # 从 npm 安装（推荐）
-npm install @openclaw/cortex-mem
+npm install @ggvc/cortex-mem
 
 # 或从源码安装
 git clone https://github.com/openclaw/cortex-mem.git
