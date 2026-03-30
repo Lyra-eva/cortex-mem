@@ -30,6 +30,14 @@
   "bugs": {
     "url": "https://github.com/openclaw/cortex-mem/issues"
   },
+  "openclaw": {
+    "compat": {
+      "pluginApi": "1.0.0"
+    },
+    "build": {
+      "openclawVersion": "2026.3.28"
+    }
+  },
   "dependencies": {
     "@hasanshoaib/ai-kit": "^0.5.18",
     "@sinclair/typebox": "^0.32.0",
